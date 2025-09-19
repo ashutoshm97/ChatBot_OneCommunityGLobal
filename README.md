@@ -1,2 +1,2 @@
-# ChatBot_OneCommunityGLobal
+# ChatBot_OneCommunityGlobal
 Chatbot for OneCommunityGlobal
