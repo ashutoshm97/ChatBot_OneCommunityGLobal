@@ -1,5 +1,6 @@
 from typing import List, Dict, Optional
 from Authentication.supabase_client import supabase_admin
+from Services.data_normalization import normalize_query
 import math
 
 async def retrieve_relevant_documents(

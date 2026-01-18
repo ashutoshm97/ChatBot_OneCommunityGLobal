@@ -7,9 +7,10 @@ from datetime import datetime
 import uuid
 
 from Authentication.supabase_client import supabase, supabase_admin
-from Services.embeddings import get_embeddings
+from Services.embeddings import get_embeddings, get_embeddings_for_document
 from Services.video_processor import process_video, extract_text_from_video
 from Services.retrieval import retrieve_relevant_documents
+from Services.data_normalization import normalize_query, normalize_metadata, normalize_and_chunk_document
 
 router = APIRouter(prefix="/rag", tags=["rag"])
 
@@ -54,32 +55,54 @@ async def store_document(
 ):
     """
     Store a text document in the database with embeddings.
+    Document text is normalized before processing.
     """
     try:
-        # Generate embeddings for the document
-        embedding = get_embeddings(document.text)
+        # Normalize and chunk document if necessary
+        chunks = normalize_and_chunk_document(document.text)
         
-        # Create document record
-        doc_id = str(uuid.uuid4())
-        document_data = {
-            "id": doc_id,
-            "text": document.text,
-            "embedding": embedding,
-            "metadata": document.metadata or {},
-            "document_type": document.document_type,
-            "user_id": user.user.id,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
-        }
+        if not chunks:
+            raise HTTPException(status_code=400, detail="Document text is empty after normalization")
         
-        # Store in Supabase (assuming you have a 'documents' table with vector column)
-        result = supabase_admin.table("documents").insert(document_data).execute()
+        # Normalize metadata
+        normalized_metadata = normalize_metadata(document.metadata)
+        
+        # Store each chunk as a separate document (or combine if single chunk)
+        doc_ids = []
+        for i, chunk in enumerate(chunks):
+            # Generate embeddings for the chunk
+            embedding = get_embeddings(chunk)
+            
+            # Create document record
+            doc_id = str(uuid.uuid4())
+            chunk_metadata = normalized_metadata.copy()
+            if len(chunks) > 1:
+                chunk_metadata["chunk_index"] = i
+                chunk_metadata["total_chunks"] = len(chunks)
+            
+            document_data = {
+                "id": doc_id,
+                "text": chunk,
+                "embedding": embedding,
+                "metadata": chunk_metadata,
+                "document_type": document.document_type,
+                "user_id": user.user.id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            # Store in Supabase
+            result = supabase_admin.table("documents").insert(document_data).execute()
+            doc_ids.append(doc_id)
         
         return {
             "message": "Document stored successfully",
-            "document_id": doc_id,
+            "document_id": doc_ids[0] if len(doc_ids) == 1 else doc_ids,
+            "chunks_created": len(chunks),
             "status": "success"
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error storing document: {str(e)}")
 
@@ -108,32 +131,53 @@ async def upload_video(
             content = await file.read()
             buffer.write(content)
         
-        # Extract text from video (transcription)
+        # Extract text from video (transcription) - already normalized in extract_text_from_video
         transcription = await extract_text_from_video(video_path)
         
         if not transcription or len(transcription.strip()) == 0:
             raise HTTPException(status_code=400, detail="Could not extract text from video")
         
-        # Generate embeddings for the transcription
-        embedding = get_embeddings(transcription)
+        # Normalize and chunk transcription if necessary
+        chunks = normalize_and_chunk_document(transcription)
         
-        # Store video metadata and transcription
-        document_data = {
-            "id": video_id,
-            "text": transcription,
-            "embedding": embedding,
-            "metadata": {
-                "title": title or file.filename,
-                "description": description,
-                "filename": file.filename,
-                "content_type": file.content_type,
-                "file_size": len(content)
-            },
-            "document_type": "video",
-            "user_id": user.user.id,
-            "created_at": datetime.utcnow().isoformat(),
-            "updated_at": datetime.utcnow().isoformat()
+        # Normalize metadata
+        raw_metadata = {
+            "title": title or file.filename,
+            "description": description,
+            "filename": file.filename,
+            "content_type": file.content_type,
+            "file_size": len(content)
         }
+        normalized_metadata = normalize_metadata(raw_metadata)
+        
+        # Store each chunk as a separate document
+        doc_ids = []
+        for i, chunk in enumerate(chunks):
+            # Generate embeddings for the chunk
+            embedding = get_embeddings(chunk)
+            
+            chunk_id = str(uuid.uuid4()) if i == 0 else str(uuid.uuid4())
+            chunk_metadata = normalized_metadata.copy()
+            if len(chunks) > 1:
+                chunk_metadata["chunk_index"] = i
+                chunk_metadata["total_chunks"] = len(chunks)
+            
+            document_data = {
+                "id": chunk_id,
+                "text": chunk,
+                "embedding": embedding,
+                "metadata": chunk_metadata,
+                "document_type": "video",
+                "user_id": user.user.id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat()
+            }
+            
+            # Store in Supabase
+            result = supabase_admin.table("documents").insert(document_data).execute()
+            doc_ids.append(chunk_id)
+        
+        video_id = doc_ids[0]  # Use first chunk ID as main video ID
         
         # Store in Supabase
         result = supabase_admin.table("documents").insert(document_data).execute()
@@ -159,6 +203,8 @@ async def upload_video(
         return {
             "message": "Video processed and stored successfully",
             "document_id": video_id,
+            "document_ids": doc_ids if len(doc_ids) > 1 else None,
+            "chunks_created": len(chunks),
             "transcription": transcription[:200] + "..." if len(transcription) > 200 else transcription,
             "status": "success"
         }
@@ -179,10 +225,14 @@ async def retrieve_documents(
 ):
     """
     Retrieve relevant documents based on a query using vector similarity search.
+    Query is normalized before processing.
     """
     try:
-        # Get query embedding
-        query_embedding = get_embeddings(query.query)
+        # Normalize query before processing
+        normalized_query = normalize_query(query.query)
+        
+        # Get query embedding (normalization happens inside get_embeddings too)
+        query_embedding = get_embeddings(normalized_query)
         
         # Retrieve relevant documents
         relevant_docs = await retrieve_relevant_documents(
@@ -193,9 +243,12 @@ async def retrieve_documents(
         
         return {
             "query": query.query,
+            "normalized_query": normalized_query,
             "results": relevant_docs,
             "count": len(relevant_docs)
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error retrieving documents: {str(e)}")
 
@@ -208,10 +261,14 @@ async def rag_chat(
 ):
     """
     Chat endpoint that uses RAG to retrieve relevant context and generate responses.
+    Message is normalized before processing.
     """
     try:
-        # Get query embedding
-        query_embedding = get_embeddings(chat.message)
+        # Normalize chat message before processing
+        normalized_message = normalize_query(chat.message)
+        
+        # Get query embedding (normalization happens inside get_embeddings too)
+        query_embedding = get_embeddings(normalized_message)
         
         # Retrieve relevant documents
         relevant_docs = await retrieve_relevant_documents(
@@ -235,6 +292,7 @@ async def rag_chat(
                 "conversation_id": chat.conversation_id,
                 "user_id": user.user.id,
                 "message": chat.message,
+                "normalized_message": normalized_message,
                 "response": response_text,
                 "retrieved_docs": [doc.get("id") for doc in relevant_docs],
                 "created_at": datetime.utcnow().isoformat()
@@ -250,6 +308,8 @@ async def rag_chat(
             "conversation_id": chat.conversation_id,
             "retrieved_count": len(relevant_docs)
         }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error in chat: {str(e)}")
 
