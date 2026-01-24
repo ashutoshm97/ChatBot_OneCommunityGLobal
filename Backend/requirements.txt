@@ -1,3 +1,8 @@
 supabase
 fastapi
-uvicorn
+uvicorn[standard]
+python-multipart
+openai
+openai-whisper
+python-dotenv
+ffmpeg-python
