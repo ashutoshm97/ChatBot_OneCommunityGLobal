@@ -3,12 +3,13 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from typing import Optional, List
 import os
+import asyncio
 from datetime import datetime
 import uuid
 
 from Authentication.supabase_client import supabase, supabase_admin
 from Services.embeddings import get_embeddings, get_embeddings_for_document
-from Services.video_processor import process_video, extract_text_from_video
+from Services.video_processor import process_video, extract_text_from_video, extract_video_chunks
 from Services.retrieval import retrieve_relevant_documents
 from Services.data_normalization import normalize_query, normalize_metadata, normalize_and_chunk_document
 
@@ -113,32 +114,37 @@ async def upload_video(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
+    chunk_duration_sec: Optional[float] = Form(120.0),
     user = Depends(verify_token)
 ):
     """
-    Upload a video file, extract text (transcription), and store with embeddings.
+    Upload a video file, split it into time-based chunks, transcribe each chunk,
+    and store each chunk in the DB with embeddings and segment metadata.
     """
+    video_path = None
     try:
         # Validate file type
         if not file.content_type or not file.content_type.startswith('video/'):
             raise HTTPException(status_code=400, detail="File must be a video")
         
         # Save video temporarily
-        video_id = str(uuid.uuid4())
-        video_path = f"/tmp/{video_id}_{file.filename}"
+        upload_id = str(uuid.uuid4())
+        video_path = f"/tmp/{upload_id}_{file.filename}"
         
+        content = await file.read()
+        file_size = len(content)
         with open(video_path, "wb") as buffer:
-            content = await file.read()
             buffer.write(content)
         
-        # Extract text from video (transcription) - already normalized in extract_text_from_video
-        transcription = await extract_text_from_video(video_path)
+        # Split video into time-based chunks and transcribe (run in thread pool to avoid blocking)
+        loop = asyncio.get_event_loop()
+        chunks = await loop.run_in_executor(
+            None,
+            lambda: extract_video_chunks(video_path, chunk_duration_sec=chunk_duration_sec or 120.0),
+        )
         
-        if not transcription or len(transcription.strip()) == 0:
+        if not chunks:
             raise HTTPException(status_code=400, detail="Could not extract text from video")
-        
-        # Normalize and chunk transcription if necessary
-        chunks = normalize_and_chunk_document(transcription)
         
         # Normalize metadata
         raw_metadata = {
@@ -146,74 +152,70 @@ async def upload_video(
             "description": description,
             "filename": file.filename,
             "content_type": file.content_type,
-            "file_size": len(content)
+            "file_size": file_size,
         }
         normalized_metadata = normalize_metadata(raw_metadata)
         
-        # Store each chunk as a separate document
-        doc_ids = []
-        for i, chunk in enumerate(chunks):
-            # Generate embeddings for the chunk
-            embedding = get_embeddings(chunk)
-            
-            chunk_id = str(uuid.uuid4()) if i == 0 else str(uuid.uuid4())
-            chunk_metadata = normalized_metadata.copy()
-            if len(chunks) > 1:
-                chunk_metadata["chunk_index"] = i
-                chunk_metadata["total_chunks"] = len(chunks)
-            
-            document_data = {
-                "id": chunk_id,
-                "text": chunk,
-                "embedding": embedding,
-                "metadata": chunk_metadata,
-                "document_type": "video",
-                "user_id": user.user.id,
-                "created_at": datetime.utcnow().isoformat(),
-                "updated_at": datetime.utcnow().isoformat()
-            }
-            
-            # Store in Supabase
-            result = supabase_admin.table("documents").insert(document_data).execute()
-            doc_ids.append(chunk_id)
-        
-        video_id = doc_ids[0]  # Use first chunk ID as main video ID
-        
-        # Store in Supabase
-        result = supabase_admin.table("documents").insert(document_data).execute()
-        
-        # Optionally store video file in Supabase Storage
+        # Optionally upload video to Supabase Storage (before loop so all chunks can reference it)
         try:
-            # Upload video to Supabase Storage
-            storage_path = f"videos/{user.user.id}/{video_id}_{file.filename}"
+            storage_path = f"videos/{user.user.id}/{upload_id}_{file.filename}"
             supabase_admin.storage.from_("videos").upload(
                 storage_path,
                 content,
                 file_options={"content-type": file.content_type}
             )
-            document_data["metadata"]["storage_path"] = storage_path
+            normalized_metadata["storage_path"] = storage_path
         except Exception as storage_error:
-            # Log but don't fail if storage upload fails
             print(f"Storage upload failed: {str(storage_error)}")
         
-        # Clean up temporary file
-        if os.path.exists(video_path):
+        doc_ids = []
+        for i, chunk_data in enumerate(chunks):
+            chunk_text = chunk_data["text"]
+            if not chunk_text or not chunk_text.strip():
+                continue
+            embedding = get_embeddings(chunk_text)
+            chunk_id = str(uuid.uuid4())
+            chunk_metadata = normalized_metadata.copy()
+            chunk_metadata["chunk_index"] = i
+            chunk_metadata["total_chunks"] = len(chunks)
+            chunk_metadata["start_sec"] = chunk_data.get("start_sec")
+            chunk_metadata["end_sec"] = chunk_data.get("end_sec")
+            
+            document_data = {
+                "id": chunk_id,
+                "text": chunk_text,
+                "embedding": embedding,
+                "metadata": chunk_metadata,
+                "document_type": "video",
+                "user_id": user.user.id,
+                "created_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.utcnow().isoformat(),
+            }
+            supabase_admin.table("documents").insert(document_data).execute()
+            doc_ids.append(chunk_id)
+        
+        primary_doc_id = doc_ids[0] if doc_ids else None
+        
+        if video_path and os.path.exists(video_path):
             os.remove(video_path)
         
+        full_transcription = " ".join(c["text"] for c in chunks).strip()
         return {
             "message": "Video processed and stored successfully",
-            "document_id": video_id,
-            "document_ids": doc_ids if len(doc_ids) > 1 else None,
-            "chunks_created": len(chunks),
-            "transcription": transcription[:200] + "..." if len(transcription) > 200 else transcription,
+            "document_id": primary_doc_id,
+            "document_ids": doc_ids if len(doc_ids) > 1 else doc_ids,
+            "chunks_created": len(doc_ids),
+            "transcription_preview": full_transcription[:200] + "..." if len(full_transcription) > 200 else full_transcription,
             "status": "success"
         }
     except HTTPException:
         raise
     except Exception as e:
-        # Clean up on error
-        if 'video_path' in locals() and os.path.exists(video_path):
-            os.remove(video_path)
+        if video_path and os.path.exists(video_path):
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
         raise HTTPException(status_code=500, detail=f"Error processing video: {str(e)}")
 
 
