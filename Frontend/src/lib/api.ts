@@ -2,8 +2,12 @@ import axios from 'axios'
 import { supabase } from './supabaseClient'
 import {
   AuthResponseSchema,
+  FileListResponseSchema,
+  UploadResponseSchema,
+  DocumentListResponseSchema,
+  DocumentUploadResponseSchema,
   type AuthResponse,
-
+  type DocumentRecord,
 } from './schemas'
 
 // Create axios instance with base configuration
@@ -33,22 +37,19 @@ api.interceptors.response.use(
     const url = response.config.url || ''
     
     try {
-      if (url.includes('/analysis/analyze')) {
-        // Temporarily disable validation to see if it's causing issues
-        // const validatedData = AnalysisResultSchema.parse(response.data)
-        // response.data = validatedData
+      if (url.includes('/auth/verify')) {
+        response.data = AuthResponseSchema.parse(response.data)
       } else if (url.includes('/upload/files')) {
-        const validatedData = FileListResponseSchema.parse(response.data)
-        response.data = validatedData
+        response.data = FileListResponseSchema.parse(response.data)
       } else if (url.includes('/upload/file')) {
-        const validatedData = UploadResponseSchema.parse(response.data)
-        response.data = validatedData
-      } else if (url.includes('/auth/verify')) {
-        const validatedData = AuthResponseSchema.parse(response.data)
-        response.data = validatedData
+        response.data = UploadResponseSchema.parse(response.data)
+      } else if (url.includes('/rag/documents') && response.config.method?.toLowerCase() === 'get') {
+        response.data = DocumentListResponseSchema.parse(response.data)
+      } else if (url.includes('/rag/documents') && response.config.method?.toLowerCase() === 'post') {
+        response.data = DocumentUploadResponseSchema.parse(response.data)
       }
-    } catch (error) {
-      // Response validation failed - continuing with raw data
+    } catch {
+      // Validation failed; keep raw response data
     }
     
     return response
@@ -83,14 +84,7 @@ export const authAPI = {
   },
 }
 
-export type DocumentRecord = {
-  id: string
-  text: string
-  metadata: Record<string, unknown> & { title?: string; source?: string; filename?: string }
-  document_type: 'text' | 'video'
-  created_at: string
-  updated_at: string
-}
+export type { DocumentRecord }
 
 export const documentsAPI = {
   list: async (params?: { skip?: number; limit?: number; document_type?: 'text' | 'video' }) => {
