@@ -3,6 +3,8 @@ import { useState, useEffect } from 'react'
 import { supabase } from './lib/supabaseClient'
 import Login from './pages/login'
 import Home from './pages/homepage'
+import Upload from './pages/upload'
+import Documents from './pages/documents'
 import './App.css'
 
 function App() {
@@ -49,6 +51,14 @@ function App() {
         <Route
           path="/"
           element={user ? <Home /> : <Navigate to="/login" replace />}
+        />
+        <Route
+          path="/upload"
+          element={user ? <Upload /> : <Navigate to="/login" replace />}
+        />
+        <Route
+          path="/documents"
+          element={user ? <Documents /> : <Navigate to="/login" replace />}
         />
         </Routes>
       </div>
